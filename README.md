@@ -5,19 +5,26 @@
 读取采样间隔 / 电压比例 / 偏移，波形以 IEEE 488.2 二进制块传输，完成后可下载
 电压-时序 CSV。
 
+板卡工程师可把已完成的记录转换为 SPICE 仿真激励：在波形页选择记录，填电压容差、
+判定阈值和点数上限，后端求出**点数最少**的折点组（仅用原采样点、保留首尾、电压
+沿用原标定），使导出点对的线性插值在每个原采样时刻误差不超过容差、是否达到阈值
+与原波形一致（等于阈值算达到）。点数在上限内可下载无表头的时间-电压点对文本
+（秒、伏），超出上限则页面显示最低点数并清除上次的下载入口。
+
 ## 快速启动（Docker Compose）
 
 ```bash
 docker compose up --build
 ```
 
-* 网页：<http://localhost:8000> （选通道 → 开始采集 → 完成后下载 CSV）
+* 网页：<http://localhost:8000> （选通道 → 开始采集 → 完成后下载 CSV；
+  下方卡片选已完成记录 → 填容差/阈值/上限 → 转换 → 下载 PWL 文本）
 * 模拟器 SCPI 端口：`localhost:5025`（可用 `nc` 或自写脚本直接发 SCPI 命令）
 
 ## 本地开发启动（不用 Docker）
 
 ```bash
-pip install fastapi 'uvicorn[standard]'
+pip install fastapi 'uvicorn[standard]' numpy
 python3 simulator/scpi_simulator.py &                 # 监听 5025
 cd web && SCOPE_PORT=5025 python3 -m uvicorn app.main:app --port 8000
 ```
@@ -26,11 +33,12 @@ cd web && SCOPE_PORT=5025 python3 -m uvicorn app.main:app --port 8000
 
 ```
 simulator/scpi_simulator.py   SCPI/TCP 示波器模拟器（纯标准库）
-web/app/main.py               FastAPI 路由（采集/取消/状态/CSV）
+web/app/main.py               FastAPI 路由（采集/取消/状态/CSV/PWL）
+web/app/pwl.py                最少折点 PWL 转换（NumPy 向量化 DP，精确最优）
 web/app/manager.py            采集队列 worker：仪器串行访问、取消语义
 web/app/instrument.py         仪器客户端：单轮单连接、5s 超时、IEEE488.2 块解析
 web/app/db.py                 SQLite 持久化
-web/app/static/index.html     操作网页（中文）
+web/app/static/index.html     操作网页（中文，含 PWL 转换卡片）
 tests/selftest.py             端到端自测（启动两端真实进程）
 docker-compose.yml            一键启动两端
 ```
@@ -54,6 +62,22 @@ docker-compose.yml            一键启动两端
   清理只触碰本轮自己的 writer，结构上不可能误关新连接。后续采集无需重启。
 * **慢响应不挡网页**：仪器 I/O 全部在后台 worker，HTTP 接口只读写 SQLite。
 * **二进制安全**：样本含 `0x0A/0x0D` 字节，客户端严格按块长度读取，绝不按行解析。
+
+## PWL 转换（最少折点）
+
+* **精确最优而非启发式**：段 `i→j` 可行 ⟺ 过两端采样点的直线在所有中间
+  采样时刻满足容差与阈值约束。对固定左端点，每个中间点的约束都是关于段斜率的
+  线性界（容差给闭区间；阈值按"达到/未达到"给闭/开界），用累积 max/min 做
+  NumPy 向量化判定，再按 DAG 最短路 DP 求最少段数。4096 点约 0.6 s，
+  路由为同步视图函数，在线程池执行，不阻塞事件循环。
+* **折点即原采样点**：首末点必含，折点电压取原标定值 `raw*scale+offset`，
+  插值在折点处零误差。
+* **阈值语义**：仅约束原采样时刻（采样点之间过零不约束）；`>=` 阈值算达到。
+* **数值松弛**：浮点斜率比较带 1e-9 相对量级的松弛，保证理论最优解不因
+  舍入丢失；导出文件误差因此最多超容差 1e-9 相对量级，阈值判定带同量级死区。
+* **导出**：无表头文本，每行 `时间 电压`（`%.9e`，秒、伏），前端以 Blob
+  下载为 `acquisition_<id>_ch<n>_pwl.txt`；超出上限时响应不含文本，
+  页面显示最低点数并清除下载入口。
 
 ## 模拟器故障注入（SCPI 扩展命令，运行时生效，无需重启）
 
@@ -81,6 +105,12 @@ docker-compose.yml            一键启动两端
 | GET | `/api/acquisitions/{id}` | 单个采集状态 |
 | POST | `/api/acquisitions/{id}/cancel` | 取消（排队/采集中均可） |
 | GET | `/api/acquisitions/{id}/csv` | 下载电压-时序 CSV（仅完成后） |
+| POST | `/api/acquisitions/{id}/pwl` | 最少折点 PWL 转换（仅完成后） |
+
+`/api/acquisitions/{id}/pwl` 请求体：`{tolerance: 电压容差(≥0), threshold: 判定阈值,
+max_points: 点数上限(≥2)}`。响应：`{ok, points, max_points}`；`points` 为最少折点数，
+`ok=true`（`points ≤ max_points`）时附 `pwl`（无表头点对文本）与 `filename`，
+`ok=false` 时不附文本。参数非法返回 422，记录不存在 404，记录未完成 409。
 
 状态机：`queued → running → done`，取消路径 `queued → cancelled`、
 `running → cancelling → cancelled`，失败为 `error`（含错误信息）。
@@ -93,7 +123,9 @@ python3 tests/selftest.py
 
 脚本拉起真实模拟器与 Web 进程，覆盖：正常采集与 CSV 数值校验（含每通道参数）、
 样本含换行字节、排队取消零命令、采集中取消的受理/上报时序、5 秒超时、
-中途断连后恢复、断连后新采集拿到当前波形（无陈旧字节）、慢响应下网页 API 延迟。
+中途断连后恢复、断连后新采集拿到当前波形（无陈旧字节）、慢响应下网页 API 延迟，
+以及 PWL 转换：方波已知最优 32 折点、导出点对逐时刻插值误差与阈值状态复核、
+阈值等于平台电压（等于算达到）、超限时报最低点数且不带文本、404/409/422。
 
 ## 已验证 / 未完成
 

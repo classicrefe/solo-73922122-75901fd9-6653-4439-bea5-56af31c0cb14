@@ -14,6 +14,11 @@ verifies the key behaviours required by the task:
  7. mid-transfer disconnect -> error; next acquisition recovers and returns the
     CURRENT waveform (no stale bytes leaking into later orders)
  8. slow instrument responses do not block the web API
+ 9. PWL conversion: minimum-breakpoint export (known 32-point optimum on the
+    square wave), exported pairs interpolate within tolerance and reproduce
+    threshold states at every original sample instant, threshold equality
+    counts as reached, over-limit conversions report the minimum and carry no
+    text, and 404/409/422 error paths
 
 Usage: python3 tests/selftest.py
 """
@@ -138,6 +143,72 @@ def expected_csv_rows(kind: str, channel: int) -> list[tuple[float, float]]:
     return [
         (i * XINCR, v * YMULT[channel] + YOFF[channel]) for i, v in enumerate(raw)
     ]
+
+
+def verify_pwl(text: str, kind: str, channel: int, tol: float, thr: float,
+               label: str, count: int | None = None) -> None:
+    """Validate an exported PWL text against the original waveform: headerless
+    time/voltage pairs, breakpoints are original samples (first/last kept),
+    and linear interpolation of the EXPORTED pairs stays within tolerance and
+    reproduces the threshold state at every original sample instant."""
+    lines = text.strip().split("\n")
+    pts = []
+    ok = True
+    for ln in lines:
+        parts = ln.split()
+        if len(parts) != 2:
+            ok = False
+            break
+        try:
+            pts.append((float(parts[0]), float(parts[1])))
+        except ValueError:
+            ok = False
+            break
+    check(ok, f"{label}: every line is a 'time voltage' pair (no header)")
+    if not ok:
+        return
+    if count is not None:
+        check(len(pts) == count, f"{label}: PWL has {count} points (got {len(pts)})")
+    expected = expected_csv_rows(kind, channel)
+    # same slack the converter allows for floating-point knife-edges
+    slack = 1e-9 * (1.0 + max(abs(v) for _, v in expected) + abs(thr))
+    check(math.isclose(pts[0][0], expected[0][0], abs_tol=1e-12)
+          and math.isclose(pts[-1][0], expected[-1][0], abs_tol=1e-12),
+          f"{label}: first and last sample instants preserved")
+    ok = all(pts[i + 1][0] > pts[i][0] for i in range(len(pts) - 1))
+    check(ok, f"{label}: strictly increasing times")
+    ok = True
+    for tp, vp in pts:
+        k = int(round(tp / XINCR))
+        if not (0 <= k < POINTS
+                and math.isclose(tp, expected[k][0], abs_tol=1e-9)
+                and math.isclose(vp, expected[k][1], rel_tol=1e-6, abs_tol=1e-6)):
+            ok = False
+            print(f"    breakpoint ({tp},{vp}) is not an original calibrated sample")
+            break
+    check(ok, f"{label}: breakpoints are original samples with original calibration")
+    ok = True
+    seg = 0
+    for te, ve in expected:
+        while seg < len(pts) - 2 and te > pts[seg + 1][0]:
+            seg += 1
+        (t0, v0), (t1, v1) = pts[seg], pts[seg + 1]
+        r = v0 if t1 == t0 else v0 + (v1 - v0) * (te - t0) / (t1 - t0)
+        if abs(r - ve) > tol + slack:
+            ok = False
+            print(f"    t={te}: interpolated {r} vs original {ve} exceeds tol {tol}")
+            break
+        if ve >= thr:
+            if r < thr - slack:
+                ok = False
+                print(f"    t={te}: reached sample but interpolated {r} < {thr}")
+                break
+        elif r >= thr - slack:
+            ok = False
+            print(f"    t={te}: below-threshold sample but interpolated {r} >= {thr}")
+            break
+    check(ok, f"{label}: interpolation within tolerance and threshold states "
+              f"match at all {POINTS} sample instants")
 
 
 def verify_csv(base: str, aid: int, kind: str, channel: int, label: str) -> None:
@@ -359,6 +430,71 @@ def main() -> int:
         a8b = job["id"]
         job = wait_status(base, a8b, ("done", "error"), 10)
         check(job["status"] == "done", "final acquisition completes")
+
+        # ---- 9. PWL conversion ---------------------------------------------
+        print("[9] PWL conversion: minimum breakpoints under tolerance + threshold")
+        simctl.set(waveform="square")
+        _, job = http_json("POST", base, "/api/acquisitions", {"channel": 1})
+        a9 = job["id"]
+        job = wait_status(base, a9, ("done", "error"), 10)
+        check(job["status"] == "done", f"square acquisition #{a9} done")
+
+        # 9a. square wave: the known optimum is 32 breakpoints
+        #     (15 transitions x 2 edge points + first/last sample)
+        status, r = http_json("POST", base, f"/api/acquisitions/{a9}/pwl",
+                              {"tolerance": 1.0, "threshold": 0.0, "max_points": 100})
+        check(status == 200 and r.get("ok") is True, "square PWL within limit")
+        check(r.get("points") == 32,
+              f"square PWL hits the known optimum of 32 points (got {r.get('points')})")
+        verify_pwl(r.get("pwl", ""), "square", 1, 1.0, 0.0, "[9a]", count=32)
+        check(isinstance(r.get("filename"), str) and r["filename"].endswith(".txt"),
+              "PWL download filename is a .txt")
+
+        # 9b. threshold exactly equals the +plateau voltage (equality = reached)
+        status, r = http_json("POST", base, f"/api/acquisitions/{a9}/pwl",
+                              {"tolerance": 1.0, "threshold": 100.0, "max_points": 100})
+        check(status == 200 and r.get("ok") is True and r.get("points") == 32,
+              f"threshold == plateau still yields 32 points (got {r.get('points')})")
+        verify_pwl(r.get("pwl", ""), "square", 1, 1.0, 100.0, "[9b]", count=32)
+
+        # 9c. limit below the minimum -> not ok, minimum reported, no text
+        status, r = http_json("POST", base, f"/api/acquisitions/{a9}/pwl",
+                              {"tolerance": 1.0, "threshold": 0.0, "max_points": 2})
+        check(status == 200 and r.get("ok") is False,
+              "over-limit conversion reported as not ok")
+        check(r.get("points") == 32 and "pwl" not in r,
+              "over-limit reports the minimum (32) and carries no PWL text")
+
+        # 9d. sine wave, tighter tolerance, non-zero threshold
+        simctl.set(waveform="sine")
+        _, job = http_json("POST", base, "/api/acquisitions", {"channel": 1})
+        a9d = job["id"]
+        job = wait_status(base, a9d, ("done", "error"), 10)
+        check(job["status"] == "done", f"sine acquisition #{a9d} done")
+        status, r = http_json("POST", base, f"/api/acquisitions/{a9d}/pwl",
+                              {"tolerance": 0.5, "threshold": 30.0, "max_points": 4096})
+        check(status == 200 and r.get("ok") is True, "sine PWL within generous limit")
+        check(2 < r.get("points", 0) <= 4096,
+              f"sine PWL point count plausible ({r.get('points')})")
+        verify_pwl(r.get("pwl", ""), "sine", 1, 0.5, 30.0, "[9d]")
+        status, r = http_json("POST", base, f"/api/acquisitions/{a9d}/pwl",
+                              {"tolerance": 0.5, "threshold": 30.0, "max_points": 2})
+        check(status == 200 and r.get("ok") is False and r.get("points", 0) > 2,
+              "sine PWL over limit=2 reports the minimum")
+
+        # 9e. error handling
+        status, _ = http("POST", base, "/api/acquisitions/999999/pwl",
+                         {"tolerance": 1.0, "threshold": 0.0, "max_points": 10})
+        check(status == 404, "PWL on unknown acquisition -> 404")
+        status, _ = http("POST", base, f"/api/acquisitions/{a6}/pwl",
+                         {"tolerance": 1.0, "threshold": 0.0, "max_points": 10})
+        check(status == 409, "PWL on incomplete acquisition -> 409")
+        status, _ = http("POST", base, f"/api/acquisitions/{a9}/pwl",
+                         {"tolerance": -1.0, "threshold": 0.0, "max_points": 10})
+        check(status == 422, "negative tolerance -> 422")
+        status, _ = http("POST", base, f"/api/acquisitions/{a9}/pwl",
+                         {"tolerance": 1.0, "threshold": 0.0, "max_points": 1})
+        check(status == 422, "max_points < 2 -> 422")
 
     finally:
         for proc in (web_proc, sim_proc):

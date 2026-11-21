@@ -37,6 +37,11 @@
   .st-error      { background: #fee2e2; color: #b91c1c; }
   .err { color: #b91c1c; font-size: 12px; max-width: 220px; overflow: hidden;
          text-overflow: ellipsis; }
+  .ok { color: #15803d; font-weight: 600; }
+  .warn { color: #c2410c; font-weight: 600; }
+  input[type="number"] { font-size: 14px; padding: 7px 10px; border-radius: 6px;
+                         border: 1px solid #c8d0d8; width: 110px; }
+  #pwlResult { margin-top: 12px; font-size: 13px; }
   #toast { position: fixed; top: 14px; right: 14px; background: #333; color: #fff;
            padding: 10px 16px; border-radius: 6px; font-size: 13px; display: none; }
   .mono { font-family: ui-monospace, Consolas, monospace; }
@@ -73,6 +78,30 @@
       </thead>
       <tbody id="rows"><tr><td colspan="10">加载中…</td></tr></tbody>
     </table>
+  </div>
+  <div class="card">
+    <div class="controls">
+      <strong>SPICE PWL 激励转换</strong>
+      <label>已完成记录：
+        <select id="pwlRecord" onchange="clearPwlResult()"></select>
+      </label>
+      <label>电压容差 (V)：
+        <input id="pwlTol" type="number" step="any" value="1">
+      </label>
+      <label>判定阈值 (V)：
+        <input id="pwlThr" type="number" step="any" value="0">
+      </label>
+      <label>点数上限：
+        <input id="pwlMax" type="number" min="2" step="1" value="500">
+      </label>
+      <button class="primary" id="pwlBtn" onclick="convertPwl()">转换</button>
+    </div>
+    <div style="color:#889;font-size:12px;margin-top:8px">
+      仅用原采样点作折点（保留首尾），电压沿用原标定；线性插值在每个原采样时刻的
+      电压误差不超过容差、是否达到阈值与原波形一致（等于阈值算达到），并取点数最少的一组。
+      点数在上限内可下载无表头的时间-电压点对文本（秒、伏），超出上限则显示最低点数。
+    </div>
+    <div id="pwlResult"></div>
   </div>
 </main>
 <div id="toast"></div>
@@ -124,7 +153,74 @@ function fmtTime(ts) {
   return d.toLocaleTimeString('zh-CN', {hour12: false}) +
          '.' + String(d.getMilliseconds()).padStart(3, '0');
 }
+// ---- SPICE PWL conversion ----
+let pwlExport = null;  // {text, filename} of the last successful conversion
+function clearPwlResult() {
+  pwlExport = null;
+  document.getElementById('pwlResult').innerHTML = '';
+}
+async function convertPwl() {
+  const sel = document.getElementById('pwlRecord');
+  const aid = parseInt(sel.value, 10);
+  if (!aid) { toast('请选择一条已完成的记录'); return; }
+  const tolerance = parseFloat(document.getElementById('pwlTol').value);
+  const threshold = parseFloat(document.getElementById('pwlThr').value);
+  const maxPoints = parseInt(document.getElementById('pwlMax').value, 10);
+  if (!(tolerance >= 0)) { toast('电压容差须为不小于 0 的数'); return; }
+  if (!isFinite(threshold)) { toast('判定阈值须为数值'); return; }
+  if (!(Number.isInteger(maxPoints) && maxPoints >= 2)) { toast('点数上限须为不小于 2 的整数'); return; }
+  const btn = document.getElementById('pwlBtn');
+  btn.disabled = true;
+  const box = document.getElementById('pwlResult');
+  try {
+    const r = await api('/api/acquisitions/' + aid + '/pwl', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({tolerance, threshold, max_points: maxPoints})
+    });
+    if (r.ok) {
+      pwlExport = {text: r.pwl, filename: r.filename};
+      box.innerHTML =
+        `<span class="ok">✓ 记录 #${aid}：最少折点 ${r.points} 点（上限 ${r.max_points}），可导出。</span> ` +
+        `<button class="link" onclick="downloadPwl()">下载 PWL 文件</button>`;
+    } else {
+      pwlExport = null;  // 超出上限：清除上次的下载入口
+      box.innerHTML =
+        `<span class="warn">✗ 记录 #${aid}：最少需要 ${r.points} 点，超过上限 ${r.max_points}，无法导出。</span>`;
+    }
+  } catch (e) {
+    clearPwlResult();
+    toast('转换失败: ' + e.message);
+  } finally {
+    btn.disabled = false;
+  }
+}
+function downloadPwl() {
+  if (!pwlExport) return;
+  const blob = new Blob([pwlExport.text], {type: 'text/plain'});
+  const a = document.createElement('a');
+  a.href = URL.createObjectURL(blob);
+  a.download = pwlExport.filename;
+  document.body.appendChild(a);
+  a.click();
+  a.remove();
+  URL.revokeObjectURL(a.href);
+}
+function updatePwlRecords(jobs) {
+  const sel = document.getElementById('pwlRecord');
+  const done = jobs.filter(j => j.status === 'done' && j.has_samples);
+  const prev = sel.value;
+  sel.innerHTML = done.length
+    ? done.map(j => `<option value="${j.id}">#${j.id}　CHANnel${j.channel}　${fmtTime(j.created_at)}</option>`).join('')
+    : '<option value="">（无已完成记录）</option>';
+  if (prev && done.some(j => String(j.id) === prev)) {
+    sel.value = prev;
+  } else if (prev !== sel.value) {
+    clearPwlResult();  // 选中的记录已变化/消失，旧导出结果不再适用
+  }
+}
 function render(jobs) {
+  updatePwlRecords(jobs);
   const tbody = document.getElementById('rows');
   if (!jobs.length) {
     tbody.innerHTML = '<tr><td colspan="10">暂无采集记录</td></tr>';
